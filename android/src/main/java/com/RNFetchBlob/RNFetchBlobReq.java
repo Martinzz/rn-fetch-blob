@@ -13,6 +13,9 @@ import android.net.Network;
 import android.net.NetworkInfo;
 import android.net.NetworkCapabilities;
 import android.net.ConnectivityManager;
+import android.os.Bundle;
+import android.os.Handler;
+import android.os.Message;
 import android.util.Base64;
 
 import com.RNFetchBlob.Response.RNFetchBlobDefaultResp;
@@ -51,6 +54,9 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.HashMap;
 
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
 import 	javax.net.ssl.SSLSocketFactory;
@@ -156,6 +162,59 @@ public class RNFetchBlobReq extends BroadcastReceiver implements Runnable {
         }
     }
 
+    private final int QUERY = 1314;
+    private ScheduledExecutorService scheduledExecutorService = Executors.newScheduledThreadPool(1);
+    private Future<?> future;
+    private Handler mHandler = new Handler(new Handler.Callback() {
+        public boolean handleMessage(Message msg) {
+            switch (msg.what) {
+
+                case QUERY:
+
+                    Bundle data = msg.getData();
+                    long id = data.getLong("downloadManagerId");
+                    if (id == downloadManagerId) {
+
+                        Context appCtx = RNFetchBlob.RCTContext.getApplicationContext();
+
+                        DownloadManager downloadManager = (DownloadManager) appCtx.getSystemService(Context.DOWNLOAD_SERVICE);
+
+                        DownloadManager.Query query = new DownloadManager.Query();
+
+                        Cursor cursor = downloadManager.query(query);
+
+                        if (cursor != null && cursor.moveToFirst()) {
+
+                            long written = cursor.getInt(cursor.getColumnIndex(DownloadManager.COLUMN_BYTES_DOWNLOADED_SO_FAR));
+
+                            long total = cursor.getLong(cursor.getColumnIndex(
+                                    DownloadManager.COLUMN_TOTAL_SIZE_BYTES));
+                            cursor.close();
+
+                            RNFetchBlobProgressConfig reportConfig = getReportProgress(taskId);
+                            float progress = (total != -1) ? written / total : 0;
+
+                            if (reportConfig != null && reportConfig.shouldReport(progress /* progress */)) {
+                                WritableMap args = Arguments.createMap();
+                                args.putString("taskId", String.valueOf(taskId));
+                                args.putString("written", String.valueOf(written));
+                                args.putString("total", String.valueOf(total));
+                                args.putString("chunk", "");
+                                RNFetchBlob.RCTContext.getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter.class)
+                                        .emit(RNFetchBlobConst.EVENT_PROGRESS, args);
+
+                            }
+
+                            if (total == written) {
+                                future.cancel(true);
+                            }
+                        }
+                    }
+            }
+            return true;
+        }
+    });
+
     @Override
     public void run() {
 
@@ -197,6 +256,17 @@ public class RNFetchBlobReq extends BroadcastReceiver implements Runnable {
                 downloadManagerId = dm.enqueue(req);
                 androidDownloadManagerTaskTable.put(taskId, Long.valueOf(downloadManagerId));
                 appCtx.registerReceiver(this, new IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE));
+                future = scheduledExecutorService.scheduleAtFixedRate(new Runnable() {
+                    @Override
+                    public void run() {
+                        Message msg = mHandler.obtainMessage();
+                        Bundle data = new Bundle();
+                        data.putLong("downloadManagerId", downloadManagerId);
+                        msg.setData(data);
+                        msg.what = QUERY;
+                        mHandler.sendMessage(msg);
+                    }
+                }, 0, 100, TimeUnit.MILLISECONDS);
                 return;
             }
 
@@ -515,6 +585,10 @@ public class RNFetchBlobReq extends BroadcastReceiver implements Runnable {
      * Remove cached information of the HTTP task
      */
     private void releaseTaskResource() {
+        if (future != null && !future.isCancelled())
+            future.cancel(true);
+        if (scheduledExecutorService != null && !scheduledExecutorService.isShutdown())
+            scheduledExecutorService.shutdown();
         if(taskTable.containsKey(taskId))
             taskTable.remove(taskId);
         if(androidDownloadManagerTaskTable.containsKey(taskId))
